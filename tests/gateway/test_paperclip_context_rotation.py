@@ -171,6 +171,9 @@ def test_publication_closes_parent_seeds_child_and_leaves_telegram_alone(db):
     # never on the closed parent and never on a fresh empty id.
     live = db.find_latest_gateway_session_for_peer(source="api_server", session_key=PAPERCLIP_KEY)
     assert live is not None and live["id"] == CHILD
+    # A heartbeat that still sends the OLD id must follow parent_session_id forward to the child:
+    # context_rotation is not a reset boundary, so the child is not skipped as a legacy reset child.
+    assert db.resolve_resume_session_id(PARENT) == CHILD
 
     # A telegram transcript is not a rotation candidate and must be untouched by one.
     assert db.get_messages_as_conversation("tg-session") == telegram_before

@@ -35,10 +35,11 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
-# End reason stamped on the closed predecessor. Registered as a reset boundary in
-# ``hermes_state_common._RESET_END_REASONS`` so the child row is read as the same conversation
-# continuing (and is never resurrected by stale-route recovery), while the reason itself stays
-# greppable in state.db for whoever is attributing a traffic-cop hit.
+# End reason stamped on the closed predecessor — deliberately NOT in
+# ``hermes_state_common._RESET_END_REASONS``. Registering it would make the child a legacy reset
+# child, and ``resolve_resume_session_id`` skips those, so a heartbeat sending the old session id
+# would resolve back to the closed parent. The reason stays greppable in state.db for whoever is
+# attributing a traffic-cop hit.
 CONTEXT_ROTATION_END_REASON = "context_rotation"
 
 # The platform value the paperclip harness drives this gateway through, and the session-key prefix
