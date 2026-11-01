@@ -281,7 +281,8 @@ class SessionCompressionMixin:
         system_prompt: str | None = None, cwd: str | None = None, profile_name: str | None = None,
         compression_lock_holder: str | None = None, require_compression_lease: bool = True,
         require_lease_refresh: bool = False, lease_ttl_seconds: float = 300.0,
-        watermark: Optional[int] = None, watermark_ceiling: Optional[int] = None) -> None:
+        watermark: Optional[int] = None, watermark_ceiling: Optional[int] = None,
+        end_reason: str = "compression") -> None:
         """Atomically close a parent and publish its durable compression child: closure, child row, and
         handoff commit in one transaction, so readers see the live parent or a complete child, never an
         ended parent with a missing/empty child. *watermark* (the parent's highest row already represented
@@ -294,6 +295,10 @@ class SessionCompressionMixin:
         *compression_lock_holder* refreshes the lease on the same ``conn`` before the expiry check (no
         TOCTOU window), so a refresher that died on transient DB errors gets one last chance.
 
+        *end_reason* stamps the closed parent. It stays ``compression`` for every compaction path;
+        the pre-emptive context rotation (gateway/paperclip_rotation.py) passes its own
+        ``context_rotation`` boundary so a traffic-cop hit can be attributed from the DB row alone.
+
         See #75316.
         ``None`` = unbounded (no internal flush happened). See #47202.
         """
@@ -302,7 +307,8 @@ class SessionCompressionMixin:
             messages=messages, model=model, model_config=model_config, system_prompt=system_prompt,
             cwd=cwd, profile_name=profile_name, compression_lock_holder=compression_lock_holder,
             require_compression_lease=require_compression_lease, require_lease_refresh=require_lease_refresh,
-            lease_ttl_seconds=lease_ttl_seconds, watermark=watermark, watermark_ceiling=watermark_ceiling), messages)
+            lease_ttl_seconds=lease_ttl_seconds, watermark=watermark, watermark_ceiling=watermark_ceiling,
+            end_reason=end_reason), messages)
 
     def _publish_compression_child_on_conn(
             self, conn, *, parent_session_id: str, child_session_id: str, source: str,
@@ -310,9 +316,15 @@ class SessionCompressionMixin:
             system_prompt: str | None = None, cwd: str | None = None, profile_name: str | None = None,
             compression_lock_holder: str | None = None, require_compression_lease: bool = True,
             require_lease_refresh: bool = False, lease_ttl_seconds: float = 300.0,
-            watermark: Optional[int] = None, watermark_ceiling: Optional[int] = None) -> None:
+            watermark: Optional[int] = None, watermark_ceiling: Optional[int] = None,
+            end_reason: str = "compression") -> None:
         """:meth:`publish_compression_child` on the caller's write transaction (never commits). The
-        owner and the worker/canonical-mutation verbs share this one body so they cannot drift."""
+        owner and the worker/canonical-mutation verbs share this one body so they cannot drift.
+
+        *end_reason* stamps the closed parent and defaults to ``compression``, so every compaction
+        caller is byte-identical to before; the pre-emptive context rotation passes
+        ``context_rotation`` (which is deliberately not a reset end-reason, so the child still
+        resolves as the parent's continuation)."""
         from hermes_state_errors import CompressionSessionBusyError
         if require_lease_refresh and compression_lock_holder:
             conn.execute(
@@ -340,7 +352,8 @@ class SessionCompressionMixin:
             # An AUTOMATIC end stamp (tui_shutdown, ws_disconnect, orphan reap, idle/LRU
             # evict) is stale by construction — this lease holder is still continuing the
             # conversation, and left alone it wedges rotation forever. Clear it; the closure
-            # UPDATE below re-stamps end_reason='compression'. Deliberate boundaries fail closed.
+            # UPDATE below re-stamps end_reason (``compression`` for a compaction,
+            # ``context_rotation`` for the pre-emptive rotation). Deliberate boundaries fail closed.
             if not is_automatic_end_reason(parent["end_reason"]):
                 raise RuntimeError(f"Compression parent already ended: {parent_session_id}")
             conn.execute(
@@ -374,8 +387,8 @@ class SessionCompressionMixin:
             "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
             (total_messages, total_tool_calls, child_session_id))
         updated = conn.execute(
-            "UPDATE sessions SET ended_at = ?, end_reason = 'compression' "
-            "WHERE id = ? AND ended_at IS NULL", (time.time(), parent_session_id))
+            "UPDATE sessions SET ended_at = ?, end_reason = ? "
+            "WHERE id = ? AND ended_at IS NULL", (time.time(), end_reason, parent_session_id))
         if updated.rowcount != 1:
             raise RuntimeError(f"Compression parent changed during publication: {parent_session_id}")
         from hermes_state_local_lineage import advance_local_target
