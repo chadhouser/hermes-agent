@@ -912,6 +912,94 @@ async def _execute_run_via_live_owner(self, run: _RunLaunch, home, record: Dict[
         _retire_live_run(self, run_id)
 
 
+def _context_rotation_settings() -> Tuple[bool, float]:
+    """``(enabled, share)`` for pre-emptive context rotation; defaults on any config error."""
+    from gateway.paperclip_rotation import (
+        DEFAULT_ROTATION_ENABLED, DEFAULT_ROTATION_SHARE, rotation_settings,
+    )
+    try:
+        from hermes_cli.config import load_config
+
+        return rotation_settings((load_config() or {}).get("compression"))
+    except Exception:
+        logger.debug("[api_server] context-rotation config read failed", exc_info=True)
+        return DEFAULT_ROTATION_ENABLED, DEFAULT_ROTATION_SHARE
+
+
+async def _maybe_rotate_paperclip_context(self, run, agent, *, _api_server) -> bool:
+    """Rotate a paperclip issue session that has reached its model's window, before the turn runs.
+
+    Returns True when the run now continues on a fresh, summary-seeded session. False for every
+    other case — not a paperclip api_server conversation, under the share, nothing compacted yet,
+    or a publication failure — and the turn then runs exactly as it did before this hook existed.
+    """
+    from gateway.paperclip_rotation import (
+        context_rotation_log_line, decide_context_rotation, is_paperclip_api_server_session,
+        projected_input_tokens, publish_context_rotation, seeded_rotation_messages,
+    )
+    from hermes_state_ids import new_session_id
+
+    gateway_session_key = (getattr(run, "gateway_session_key", "") or "").strip()
+    # ONE gate, shared by every rotation path: source=api_server AND a `paperclip:` session key.
+    # Telegram/CLI/Discord conversations never match, whatever the config says.
+    if not is_paperclip_api_server_session(gateway_session_key, "api_server"):
+        return False
+    history = list(getattr(run, "conversation_history", None) or [])
+    if len(history) < 4:
+        return False
+    enabled, share = _context_rotation_settings()
+    if not enabled:
+        return False
+    db = self._ensure_session_db()
+    if db is None:
+        return False
+    parent_session_id = str(getattr(run, "session_id", "") or "")
+    if not parent_session_id:
+        return False
+    window = int(getattr(getattr(agent, "context_compressor", None), "context_length", 0) or 0)
+    tokens, token_source = await asyncio.to_thread(
+        projected_input_tokens, db=db, session_id=parent_session_id, history=history,
+    )
+    decision = decide_context_rotation(
+        enabled=enabled, share=share, context_length=window, projected_tokens=tokens,
+        session_key=gateway_session_key, platform="api_server", history=history,
+    )
+    if not decision.rotate:
+        logger.debug(
+            "[api_server] context rotation not taken for %s: %s (%s tokens, %s)",
+            parent_session_id, decision.reason, tokens, token_source,
+        )
+        return False
+    seed = seeded_rotation_messages(history, decision.summary_indices)
+    if not seed:
+        return False
+    child_session_id = new_session_id()
+    published = await asyncio.to_thread(
+        publish_context_rotation, db,
+        parent_session_id=parent_session_id, child_session_id=child_session_id,
+        seed_messages=seed, model=getattr(agent, "model", None),
+    )
+    if not published:
+        return False
+    # The run continues on the child: its id, its seeded history, and the agent's own binding —
+    # the same mid-turn session-id reassignment a compression rotation performs.
+    run.session_id = child_session_id
+    run.conversation_history = seed
+    with suppress(Exception):
+        run.agent_kwargs["session_id"] = child_session_id
+    with suppress(Exception):
+        agent.session_id = child_session_id
+        agent.reset_session_state(previous_messages=seed, old_session_id=parent_session_id)
+    logger.warning(context_rotation_log_line(
+        old_session_id=parent_session_id, new_session_id=child_session_id,
+        session_key=gateway_session_key, message_count=len(history),
+        projected_tokens=tokens, threshold_tokens=decision.threshold_tokens,
+        share=decision.share, context_length=decision.context_length,
+        seeded_messages=len(seed), seeded_tokens=decision.seeded_tokens,
+    ))
+    return True
+
+
 async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
     """Drive one admitted run, publish its terminal event/status, release live state."""
     _redact_api_error_text = _api_server._redact_api_error_text
@@ -961,6 +1049,11 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             agent = self._create_agent(
                 stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
                 interim_assistant_callback=_interim_cb, **run.agent_kwargs)
+            # A paperclip issue session that has reached its model's window rotates HERE, before the
+            # turn runs: the agent continues from the transcript's own compaction summary instead of
+            # carrying a session the model can no longer read (gateway/paperclip_rotation.py). Inside
+            # the profile scope so the child row lands in the owning profile's state.db.
+            await _maybe_rotate_paperclip_context(self, run, agent, _api_server=_api_server)
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
         result, usage, served_runtime = await _submit_api_worker(

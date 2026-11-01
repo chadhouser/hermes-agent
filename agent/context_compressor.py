@@ -166,6 +166,9 @@ def _response_finish_reason(response: Any) -> str:
 # compaction checkpoint would silently truncate the conversation's memory and feed the cut-off text back
 # into every subsequent iterative-update prompt. (Ported from earendil-works/pi#7048 / commit 97fa14e39.)
 _TRUNCATED_SUMMARY_MARKER = "finish_reason=length"
+# Sentinel for "did not retry": distinguishes a retry that returned None (the shrunk window
+# failed too, which must NOT be re-retried) from "no retry was attempted at all".
+_NO_TRUNCATION_RETRY: Any = object()
 
 # A provider can return a natural-language refusal with finish_reason="stop". It is
 # non-empty, so the usual response validation accepts it, but it contains none of
@@ -4007,6 +4010,11 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             self._reset_consecutive_overload_aborts()
             return self._with_summary_prefix(summary)
         except Exception as e:
+            _retried = self._retry_truncated_summary_smaller_window(
+                e, turns_to_summarize, focus_topic, memory_context,
+            )
+            if _retried is not _NO_TRUNCATION_RETRY:
+                return _retried
             return self._on_summary_failure(e, turns_to_summarize, focus_topic, memory_context)
 
     def _build_summary_prompt(
@@ -4141,6 +4149,62 @@ use. If none appear, omit this section entirely.]
 Target ~{summary_budget + (_LEAN_SESSION_LOG_BUDGET_TOKENS if _session_log_section else 0)} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
 {_temporal_anchoring_rule}
 Write only the summary body. Do not include any preamble or prefix."""
+
+    def _retry_truncated_summary_smaller_window(
+        self, error: Exception, turns_to_summarize: List[Dict[str, Any]],
+        focus_topic: Optional[str], memory_context: str,
+    ) -> Any:
+        """A summary cut off by the output cap gets ONE retry on a narrower window.
+
+        ``finish_reason=length`` says the summary the provider produced is partial, and persisting a
+        partial summary as the compaction checkpoint would silently truncate the conversation's
+        memory. Failing the pass outright is also wrong: the transcript keeps its current size, the
+        cooldown parks the next attempt for 30-900s, and the caller's next request overflows the
+        model window — the dead heartbeat this path exists to prevent (CUS-3576).
+
+        So: drop the oldest turns of THIS window (already the oldest content in the transcript) and
+        retry once, telling the summarizer explicitly that the dropped turns are not covered. The
+        retry is armed per attempt, so a second truncation falls straight through to the existing
+        abort machinery. Returns ``_NO_TRUNCATION_RETRY`` when the error is not a truncation, the
+        retry was already spent, or the window is too small to shrink.
+        """
+        if not (isinstance(error, RuntimeError) and _TRUNCATED_SUMMARY_MARKER in str(error)):
+            return _NO_TRUNCATION_RETRY
+        if getattr(self, "_summary_truncation_retry_armed", False):
+            return _NO_TRUNCATION_RETRY
+        shrunk = self._shrink_summary_window(turns_to_summarize)
+        if shrunk is None:
+            return _NO_TRUNCATION_RETRY
+        dropped = len(turns_to_summarize) - len(shrunk)
+        note = (
+            f"[{dropped} oldest turn(s) of this window were dropped before summarising: the previous "
+            "attempt hit the summarizer's output token cap. Do not claim those turns are covered.]"
+        )
+        self._summary_truncation_retry_armed = True
+        logger.warning(
+            "Context summary hit the output token cap over %d turns: retrying once against the "
+            "newest %d turns (dropping %d oldest)", len(turns_to_summarize), len(shrunk), dropped,
+        )
+        try:
+            return self._generate_summary(
+                shrunk, focus_topic=focus_topic,
+                memory_context=f"{memory_context}\n{note}" if memory_context else note,
+                bypass_cooldown=True,
+            )
+        finally:
+            self._summary_truncation_retry_armed = False
+
+    @staticmethod
+    def _shrink_summary_window(turns_to_summarize: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+        """Newest half of the window (at least two turns), or None when nothing can be dropped."""
+        turns = list(turns_to_summarize or ())
+        n = len(turns)
+        if n < 4:
+            # One exchange is not a window: dropping its oldest "turn" would summarise an answer
+            # with no question.
+            return None
+        keep = max(2, n // 2)
+        return turns[-keep:] if keep < n else None
 
     def _on_summary_failure(
         self, e: Exception, turns_to_summarize: List[Dict[str, Any]], focus_topic: Optional[str], memory_context: str,
