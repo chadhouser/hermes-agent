@@ -11,6 +11,10 @@ Two things are pinned here:
   byte-identical before and after.
 """
 
+import asyncio
+import contextlib
+import pathlib
+
 import pytest
 
 from agent.context_compressor import SUMMARY_PREFIX, _SUMMARY_END_MARKER
@@ -204,3 +208,126 @@ def test_log_line_names_the_attribution_fields():
     ):
         assert needle in line
     assert "\n" not in line
+
+
+class _StubHandler:
+    """The slice of the api_server request handler ``_maybe_rotate_paperclip_context`` uses.
+
+    The hook is called from ``_handle_runs``, which needs a live gateway; only these five
+    collaborators matter to it, so the run-path behaviour is pinnable without one.
+    """
+
+    def __init__(self, store):
+        self._db = store
+
+    def _profile_scope(self, profile_name):
+        return contextlib.nullcontext()
+
+    def _ensure_session_db(self):
+        return self._db
+
+    def _session_model_override_for(self, session_key):
+        return None
+
+    def _stored_session_model(self, session_row):
+        return None
+
+
+def _patch_run_path(monkeypatch, *, enabled=True, share=0.85, window=CONTEXT_LENGTH, projected=PROJECTED):
+    """Pin the hook's three non-DB inputs: config, the model's window, and the projection."""
+    from gateway.platforms import api_server_runs as runs_mod
+
+    monkeypatch.setattr(runs_mod, "_context_rotation_settings", lambda: (enabled, share))
+    monkeypatch.setattr(runs_mod, "_rotation_context_window", lambda model, route: window)
+    import gateway.paperclip_rotation as rotation
+
+    monkeypatch.setattr(
+        rotation, "projected_input_tokens",
+        lambda *, db, session_id, history: (projected, "test"),
+    )
+    return runs_mod
+
+
+def _rotate(handler, history, session_key=PAPERCLIP_KEY):
+    from gateway.platforms import api_server_runs as runs_mod
+
+    return asyncio.run(runs_mod._maybe_rotate_paperclip_context(
+        handler, session_id=PARENT, gateway_session_key=session_key,
+        history=history, request_profile=None,
+    ))
+
+
+def test_run_path_hook_rotates_the_transcript_before_the_turn(db, monkeypatch):
+    """The run path itself — not just ``publish_context_rotation`` — must rotate the transcript.
+
+    This is the port's load-bearing claim: on the deployed gateway a paperclip ``/v1/runs`` turn
+    is admitted down the canonical ``run.admission`` path, which builds no agent object, so a hook
+    living in the legacy ``_create_agent`` branch would never fire. The rotation therefore runs in
+    ``_handle_runs`` before admission, and this pins that it publishes and returns the seeded child
+    the run must continue on.
+    """
+    runs_mod = _patch_run_path(monkeypatch)
+    history = db.get_messages_as_conversation(PARENT)
+
+    rotated = _rotate(_StubHandler(db), history)
+
+    assert rotated is not None, "the hook declined a paperclip session already past the share"
+    child, seed = rotated
+    assert child and child != PARENT
+    assert len(seed) == 1 and "shipped the parser" in seed[0]["content"]
+
+    parent = dict(db.get_session(PARENT))
+    assert parent["ended_at"] is not None
+    assert parent["end_reason"] == CONTEXT_ROTATION_END_REASON
+    child_row = dict(db.get_session(child))
+    assert child_row["ended_at"] is None
+    assert child_row["parent_session_id"] == PARENT
+    assert child_row["session_key"] == PAPERCLIP_KEY
+    # The run continues on the child, and a heartbeat still sending the parent id follows it.
+    assert db.resolve_resume_session_id(PARENT) == child
+    # The helper is what ``_handle_runs`` assigns back over the turn's session id + history.
+    assert callable(runs_mod._maybe_rotate_paperclip_context)
+
+
+def test_run_path_hook_declines_and_leaves_the_parent_live(db, monkeypatch):
+    """Every non-qualifying case returns None, so the turn runs exactly as it did before."""
+    _patch_run_path(monkeypatch)
+    handler = _StubHandler(db)
+    history = db.get_messages_as_conversation(PARENT)
+
+    assert _rotate(handler, history, session_key=TELEGRAM_KEY) is None
+    assert _rotate(handler, history=history[:2]) is None
+
+    _patch_run_path(monkeypatch, enabled=False)
+    assert _rotate(handler, history) is None
+
+    _patch_run_path(monkeypatch, window=0)
+    assert _rotate(handler, history) is None
+
+    parent = dict(db.get_session(PARENT))
+    assert parent["ended_at"] is None and parent["end_reason"] is None
+    assert db.find_latest_gateway_session_for_peer(source="api_server", session_key=PAPERCLIP_KEY)["id"] == PARENT
+
+
+def test_rotation_sits_on_the_pre_admission_run_path():
+    """Structural guard against the hook drifting back into the legacy executor branch.
+
+    ``main`` runs a paperclip turn down ``if run.admission is not None:`` (observe_api_turn, no
+    agent object); the legacy ``else: _create_agent`` branch is not the path paperclip takes. The
+    call must therefore be in ``_handle_runs``, before ``_RunLaunch`` is built and before the
+    admission is attempted, and must not exist in ``_execute_run`` at all.
+    """
+    from gateway.platforms import api_server_runs as runs_mod
+
+    source = pathlib.Path(runs_mod.__file__).read_text(encoding="utf-8")
+    call = "rotated = await _maybe_rotate_paperclip_context("
+    handle = source[source.index("async def _handle_runs("):source.index("async def _execute_run(")]
+    execute = source[source.index("async def _execute_run("):]
+
+    assert handle.count(call) == 1
+    assert handle.index(call) < handle.index("launch = _RunLaunch(")
+    assert handle.index(call) < handle.index("await _admit_run_to_authority(")
+    assert call not in execute
+    # Both executor paths must still be there — the port must not "fix" this by deleting one.
+    assert "if run.admission is not None:" in execute
+    assert "agent = self._create_agent(" in execute
