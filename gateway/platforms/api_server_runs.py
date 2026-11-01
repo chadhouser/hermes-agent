@@ -1099,38 +1099,51 @@ async def _maybe_rotate_paperclip_context(
     if not enabled:
         return None
     # Inside the profile scope so the child row lands in the owning profile's state.db, exactly
-    # where the admission that follows will look for the session.
-    with self._profile_scope(request_profile):
-        db = self._ensure_session_db()
-        if db is None:
-            return None
-        session_row = await asyncio.to_thread(db.get_session, parent_session_id)
-        model, route_for_window = _rotation_model_and_route(
-            self, session_key=(gateway_session_key or "").strip(), session_row=session_row,
-            route=route, requested_model=requested_model)
-        window = await asyncio.to_thread(_rotation_context_window, model, route_for_window)
-        tokens, token_source = await asyncio.to_thread(
-            projected_input_tokens, db=db, session_id=parent_session_id, history=history,
-        )
-        decision = decide_context_rotation(
-            enabled=enabled, share=share, context_length=window, projected_tokens=tokens,
-            session_key=gateway_session_key, platform="api_server", history=history,
-        )
-        if not decision.rotate:
-            logger.debug(
-                "[api_server] context rotation not taken for %s: %s (%s tokens, %s)",
-                parent_session_id, decision.reason, tokens, token_source,
+    # where the admission that follows will look for the session.  Anything in here may raise —
+    # a locked state.db is the ordinary case under concurrent writers — and ``_handle_runs``
+    # calls this AFTER reserving the run's idempotency record, its ``queued`` status, its stream
+    # and its owner.  An escaping exception would 500 the request with none of those dropped, and
+    # a Paperclip retry carrying the same ``Idempotency-Key`` would then replay a 202 for a run
+    # that never executes.  So the hook fails open: the docstring's ``None`` is total.
+    try:
+        with self._profile_scope(request_profile):
+            db = self._ensure_session_db()
+            if db is None:
+                return None
+            session_row = await asyncio.to_thread(db.get_session, parent_session_id)
+            model, route_for_window = _rotation_model_and_route(
+                self, session_key=(gateway_session_key or "").strip(), session_row=session_row,
+                route=route, requested_model=requested_model)
+            window = await asyncio.to_thread(_rotation_context_window, model, route_for_window)
+            tokens, token_source = await asyncio.to_thread(
+                projected_input_tokens, db=db, session_id=parent_session_id, history=history,
             )
-            return None
-        seed = seeded_rotation_messages(history, decision.summary_indices)
-        if not seed:
-            return None
-        child_session_id = new_session_id()
-        published = await asyncio.to_thread(
-            publish_context_rotation, db,
-            parent_session_id=parent_session_id, child_session_id=child_session_id,
-            seed_messages=seed, model=model,
+            decision = decide_context_rotation(
+                enabled=enabled, share=share, context_length=window, projected_tokens=tokens,
+                session_key=gateway_session_key, platform="api_server", history=history,
+            )
+            if not decision.rotate:
+                logger.debug(
+                    "[api_server] context rotation not taken for %s: %s (%s tokens, %s)",
+                    parent_session_id, decision.reason, tokens, token_source,
+                )
+                return None
+            seed = seeded_rotation_messages(history, decision.summary_indices)
+            if not seed:
+                return None
+            child_session_id = new_session_id()
+            published = await asyncio.to_thread(
+                publish_context_rotation, db,
+                parent_session_id=parent_session_id, child_session_id=child_session_id,
+                seed_messages=seed, model=model,
+            )
+    except Exception:
+        logger.warning(
+            "[api_server] context rotation skipped for %s", parent_session_id, exc_info=True,
         )
+        return None
+    # Past this point the child is published: the run must continue on it, never fall back to the
+    # closed parent, so these stay outside the fail-open guard.
     if not published:
         return None
     logger.warning(context_rotation_log_line(

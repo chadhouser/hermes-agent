@@ -14,6 +14,7 @@ Two things are pinned here:
 import asyncio
 import contextlib
 import pathlib
+import sqlite3
 
 import pytest
 
@@ -302,6 +303,39 @@ def test_run_path_hook_declines_and_leaves_the_parent_live(db, monkeypatch):
     assert _rotate(handler, history) is None
 
     _patch_run_path(monkeypatch, window=0)
+    assert _rotate(handler, history) is None
+
+    parent = dict(db.get_session(PARENT))
+    assert parent["ended_at"] is None and parent["end_reason"] is None
+    assert db.find_latest_gateway_session_for_peer(source="api_server", session_key=PAPERCLIP_KEY)["id"] == PARENT
+
+
+def _raising_store(store):
+    """A store whose reads raise, the way a locked ``state.db`` does under concurrent writers."""
+
+    class _RaisingStore:
+        def get_session(self, session_id):
+            raise sqlite3.OperationalError("database is locked")
+
+        def __getattr__(self, name):
+            return getattr(store, name)
+
+    return _RaisingStore()
+
+
+def test_run_path_hook_fails_open_when_the_store_raises(db, monkeypatch):
+    """A raising store must not escape the hook: it returns None and the parent stays live.
+
+    ``_handle_runs`` calls this hook AFTER reserving the run's idempotency record, its ``queued``
+    status, its stream and its owner. An exception escaping here is a 500 with none of those
+    reservations dropped, and Paperclip sends ``Idempotency-Key: <paperclip runId>``, so the retry
+    would replay a 202 for a run that never executes. The helper's docstring promises ``None`` on
+    every failure; this pins that promise on the run path itself.
+    """
+    _patch_run_path(monkeypatch)
+    handler = _StubHandler(_raising_store(db))
+    history = db.get_messages_as_conversation(PARENT)
+
     assert _rotate(handler, history) is None
 
     parent = dict(db.get_session(PARENT))
