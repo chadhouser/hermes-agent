@@ -802,6 +802,21 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
                 self._run_statuses, self._run_owners)
             return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
         self._run_idempotency_ids.add(run_id)
+    request_profile = _api_server._api_request_profile.get()
+    # A paperclip issue session that has reached its model's window rotates HERE — before the
+    # admission binds a target session, which is the only point that precedes the turn for every
+    # executor below: the canonical `run.admission` path builds no agent object (and its owner
+    # drain may already be running the turn by the time `_execute_run` gets there), so the
+    # transcript has to change before the turn is admitted. The run then continues on the child:
+    # this id, its seeded history, and the admission that follows them
+    # (gateway/paperclip_rotation.py). Inside the profile scope so the child row lands in the
+    # owning profile's state.db.
+    rotated = await _maybe_rotate_paperclip_context(
+        self, session_id=str(session_id), gateway_session_key=gateway_session_key,
+        history=conversation_history, request_profile=request_profile,
+        route=route, requested_model=agent_overrides.get("requested_model"))
+    if rotated is not None:
+        session_id, conversation_history = rotated
     launch = _RunLaunch(
         self, run_id, q, session_id, gateway_session_key, _declared_selected, user_message,
         conversation_history, session_history_delivery,
@@ -809,7 +824,7 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
             ephemeral_system_prompt=instructions, session_id=session_id, gateway_session_key=gateway_session_key,
             route=route, room_dispatch=room_dispatch, room_execution_policy=room_execution_policy,
             **{k: agent_overrides.get(k) for k in ("requested_model", "requested_provider", "model_options")}),
-        request_profile=_api_server._api_request_profile.get(),
+        request_profile=request_profile,
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
         turn_author=turn_author)
@@ -992,6 +1007,153 @@ async def _execute_run_via_live_owner(self, run: _RunLaunch, home, record: dict[
         with suppress(Exception):
             run.put_event(None)  # sentinel: close the SSE stream
         _retire_live_run(self, run_id)
+
+
+def _context_rotation_settings() -> Tuple[bool, float]:
+    """``(enabled, share)`` for pre-emptive context rotation; defaults on any config error."""
+    from gateway.paperclip_rotation import (
+        DEFAULT_ROTATION_ENABLED, DEFAULT_ROTATION_SHARE, rotation_settings,
+    )
+    try:
+        from hermes_cli.config import load_config
+
+        return rotation_settings((load_config() or {}).get("compression"))
+    except Exception:
+        logger.debug("[api_server] context-rotation config read failed", exc_info=True)
+        return DEFAULT_ROTATION_ENABLED, DEFAULT_ROTATION_SHARE
+
+
+def _rotation_model_and_route(self, *, session_key: str, session_row: Any,
+                              route: Any, requested_model: Any) -> Tuple[Optional[str], Optional[dict]]:
+    """``(model, route)`` the window is looked up against, in ``_select_agent_runtime``'s order.
+
+    A session ``/model`` override wins and carries its own credentials; then the session's
+    persisted model; then the request's route alias; then the per-request model. ``None`` as the
+    model means the configured gateway default, which is what a paperclip heartbeat gets.
+    """
+    override = self._session_model_override_for(session_key) or {}
+    override_model = str(override.get("model") or "").strip()
+    if override_model:
+        override_route = {k: override[k] for k in ("provider", "base_url", "api_key") if override.get(k)}
+        return override_model, (override_route or None)
+    stored_model = self._stored_session_model(session_row)
+    if stored_model:
+        return str(stored_model), None
+    if route is not None:
+        route_cfg = route if isinstance(route, dict) else {}
+        return (str(route_cfg.get("model") or "").strip() or None), route_cfg
+    request_model = str(requested_model or "").strip()
+    return (request_model or None), None
+
+
+def _rotation_context_window(model: Optional[str], route: Optional[dict]) -> int:
+    """The context window the serving model resolves to; 0 when it cannot be resolved.
+
+    Same resolution the gateway's own agents use (``_resolve_gateway_model_context``, which
+    ``_create_agent`` feeds). 0 makes the gate decline on ``no_context_length``: an unknown
+    window still compresses safely, it just must not rotate. May block on catalog probes —
+    call off-loop.
+    """
+    from gateway.run import _resolve_gateway_model_context
+
+    try:
+        return int(getattr(_resolve_gateway_model_context(model=model, route=route), "context_length", 0) or 0)
+    except Exception:
+        logger.debug("[api_server] context-rotation window resolution failed", exc_info=True)
+        return 0
+
+
+async def _maybe_rotate_paperclip_context(
+    self, *, session_id: str, gateway_session_key: str, history: List[dict],
+    request_profile: Optional[str], route: Any = None, requested_model: Any = None,
+) -> Optional[Tuple[str, List[dict]]]:
+    """Rotate a paperclip issue session at its model's window — BEFORE the turn is admitted.
+
+    Called from ``_handle_runs`` with the transcript the run will use, while no admission has
+    bound a target session yet. That placement is the port's whole point: the canonical
+    ``run.admission`` path builds no agent object, and its authority drain may already be
+    executing the turn by the time ``_execute_run`` reaches the branch, so the transcript has to
+    change before admission. The admission then targets the child, and every executor (live
+    owner, canonical, legacy agent) runs on it.
+
+    Returns ``(child_session_id, seed_messages)`` when the run now continues on a fresh,
+    summary-seeded session; None for every other case — not a paperclip api_server conversation,
+    under the share, nothing compacted yet, or a publication failure — and the turn then runs
+    exactly as it did before this hook existed.
+    """
+    from gateway.paperclip_rotation import (
+        context_rotation_log_line, decide_context_rotation, is_paperclip_api_server_session,
+        projected_input_tokens, publish_context_rotation, seeded_rotation_messages,
+    )
+    from hermes_state_ids import new_session_id
+
+    parent_session_id = str(session_id or "")
+    # ONE gate, shared by every rotation path: source=api_server AND a `paperclip:` session key.
+    # Telegram/CLI/Discord conversations never match, whatever the config says.
+    if not parent_session_id or not is_paperclip_api_server_session(gateway_session_key, "api_server"):
+        return None
+    history = list(history or [])
+    if len(history) < 4:
+        return None
+    enabled, share = _context_rotation_settings()
+    if not enabled:
+        return None
+    # Inside the profile scope so the child row lands in the owning profile's state.db, exactly
+    # where the admission that follows will look for the session.  Anything in here may raise —
+    # a locked state.db is the ordinary case under concurrent writers — and ``_handle_runs``
+    # calls this AFTER reserving the run's idempotency record, its ``queued`` status, its stream
+    # and its owner.  An escaping exception would 500 the request with none of those dropped, and
+    # a Paperclip retry carrying the same ``Idempotency-Key`` would then replay a 202 for a run
+    # that never executes.  So the hook fails open: the docstring's ``None`` is total.
+    try:
+        with self._profile_scope(request_profile):
+            db = self._ensure_session_db()
+            if db is None:
+                return None
+            session_row = await asyncio.to_thread(db.get_session, parent_session_id)
+            model, route_for_window = _rotation_model_and_route(
+                self, session_key=(gateway_session_key or "").strip(), session_row=session_row,
+                route=route, requested_model=requested_model)
+            window = await asyncio.to_thread(_rotation_context_window, model, route_for_window)
+            tokens, token_source = await asyncio.to_thread(
+                projected_input_tokens, db=db, session_id=parent_session_id, history=history,
+            )
+            decision = decide_context_rotation(
+                enabled=enabled, share=share, context_length=window, projected_tokens=tokens,
+                session_key=gateway_session_key, platform="api_server", history=history,
+            )
+            if not decision.rotate:
+                logger.debug(
+                    "[api_server] context rotation not taken for %s: %s (%s tokens, %s)",
+                    parent_session_id, decision.reason, tokens, token_source,
+                )
+                return None
+            seed = seeded_rotation_messages(history, decision.summary_indices)
+            if not seed:
+                return None
+            child_session_id = new_session_id()
+            published = await asyncio.to_thread(
+                publish_context_rotation, db,
+                parent_session_id=parent_session_id, child_session_id=child_session_id,
+                seed_messages=seed, model=model,
+            )
+    except Exception:
+        logger.warning(
+            "[api_server] context rotation skipped for %s", parent_session_id, exc_info=True,
+        )
+        return None
+    # Past this point the child is published: the run must continue on it, never fall back to the
+    # closed parent, so these stay outside the fail-open guard.
+    if not published:
+        return None
+    logger.warning(context_rotation_log_line(
+        old_session_id=parent_session_id, new_session_id=child_session_id,
+        session_key=gateway_session_key, message_count=len(history),
+        projected_tokens=tokens, threshold_tokens=decision.threshold_tokens,
+        share=decision.share, context_length=decision.context_length,
+        seeded_messages=len(seed), seeded_tokens=decision.seeded_tokens,
+    ))
+    return child_session_id, seed
 
 
 async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:

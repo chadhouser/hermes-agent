@@ -643,6 +643,17 @@ DEFAULT_CONFIG = {
         # turn proceeds uncompressed; the detached worker keeps its watermark-fenced commit, so the
         # summary is adopted at the next safe boundary.
         "hygiene_max_turn_hold_seconds": 10,
+        # Context rotation for paperclip issue sessions (gateway/paperclip_rotation.py): when a
+        # session keyed by a paperclip conversation (source=api_server) is already this close to
+        # the model's window that a compression pass would be needed anyway, the gateway closes
+        # the session (end_reason=context_rotation) and opens the next transcript on the
+        # compaction summary the old one already carries, instead of spending a summary call the
+        # provider may truncate. Default ON; the gate only ever matches source=api_server plus a
+        # `paperclip:` session key, so telegram/cli/discord sessions are never rotated.
+        "rotate_before_overflow": True,
+        # Share of the model's context_length at which that rotation fires. Clamped to 0.50-0.99;
+        # it can never fire before the gateway's 0.85 session-hygiene pass.
+        "rotation_input_share": 0.85,
         # Inactivity budget for in-agent compress_context (loop, /compress, preflight); same
         # progress-aware semantics as hygiene_timeout_seconds. 0 = disable the owned wrapper
         # (callers passing commit_fence, e.g. gateway hygiene, never use it). Floored at the auxiliary

@@ -157,7 +157,8 @@ class TestGenerateSummaryTruncationGuard:
                 recorded.append(round(cooldown))
                 clock[0] += cooldown + 1  # the next turn arrives right after the cooldown lapses
         assert recorded == [60, 300, 900, 900]
-        assert call.call_count == 4
+        # Each truncated pass now makes one shrink retry (CUS-3576), so two calls per turn.
+        assert call.call_count == 8
         # Truncation keeps its own streak: the timeout ladder (which arms the deterministic stall
         # fallback via _prior_timeout_failures) is untouched.
         assert c._consecutive_timeout_failures == 0
